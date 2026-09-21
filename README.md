@@ -3,8 +3,8 @@
 Analysis supporting two interactive features relating to Indigenous
 communities and disaster recovery and resilience.
 
-- **Feature 1:** [LINK HERE]
-- **Feature 2:** [LINK HERE]
+- **Feature 1:** https://www.urban.org/data-tools/disaster-data-federal-funding-strategies-tribes-indigenous-communities
+- **Feature 2:** https://www.urban.org/stories/indigenous-communities-tribes-disaster-risks-recovery-resilience
 
 ## Repository layout
 
