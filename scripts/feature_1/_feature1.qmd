@@ -1,0 +1,297 @@
+---
+title: "Feature 1 — Indigenous community eligibility summary"
+subtitle: "FEMA disaster declarations, calendar years 2014–2026; program eligibility windows vary by program"
+format:
+  html:
+    toc: true
+    df-print: kable
+execute:
+  warning: true
+  message: true
+---
+
+Summarizes each Indigenous community's history of presidentially-declared disasters. 
+
+Set the `rerun` flag below to `TRUE` to re-execute the full pipeline;
+otherwise this document reads the most recent cached outputs from
+`data/fema/`.
+
+```{r setup}
+library(tidyverse)
+library(arrow)
+library(sf)
+library(here)
+library(janitor)
+```
+
+```{r}
+params = list(rerun = TRUE)
+```
+
+```{r run-pipeline}
+find_dated_files <- function(stem, ext = "parquet") {
+  list.files(
+    here("data", "fema"),
+    pattern = str_c("^feature_1_", stem, "_\\d{4}_\\d{2}_\\d{2}\\.", ext, "$"),
+    full.names = TRUE)
+}
+
+needs_rerun <- isTRUE(params$rerun) ||
+  length(find_dated_files("eligibility")) == 0 ||
+  length(find_dated_files("eligibility_detail")) == 0 ||
+  length(find_dated_files("universe_sf", ext = "rds")) == 0 ||
+  length(find_dated_files("counties_sf", ext = "rds")) == 0
+if (needs_rerun) {
+  source(here::here("scripts", "feature_1", "00_run_feature_1.R"))
+  run_feature_1(refresh_fema = TRUE)
+}
+```
+
+Read the most recent data files from the local cache (generated/updated in the chunk above.)
+
+```{r load-outputs}
+latest_for <- function(stem, ext = "parquet") {
+  paths <- find_dated_files(stem, ext = ext)
+  tibble(path = paths) %>%
+    mutate(snapshot_date = path %>% str_extract("\\d{4}_\\d{2}_\\d{2}") %>%
+             str_replace_all("_", "-") %>% ymd()) %>%
+    slice_max(snapshot_date, n = 1) %>%
+    pull(path)
+}
+
+tier_levels <- c("direct_named_match", "direct_spatial_county_match",
+                 "statewide_state_match", "no_match")
+
+classified <- read_parquet(latest_for("classified_declarations"))
+tribal_declarations <- read_parquet(latest_for("tribal_declarations"))
+county_declarations <- read_parquet(latest_for("county_declarations"))
+statewide_declarations <- read_parquet(latest_for("statewide_declarations"))
+universe <- read_parquet(latest_for("universe"))
+results <- read_parquet(latest_for("eligibility")) %>%
+  mutate(tier = factor(tier, levels = tier_levels, ordered = TRUE))
+
+results_detail <- arrow::read_parquet(latest_for("eligibility_detail")) %>%
+  collect() %>%
+  mutate(tier = factor(tier, levels = tier_levels, ordered = TRUE))
+universe_sf <- readRDS(latest_for("universe_sf", ext = "rds"))
+counties_sf <- readRDS(latest_for("counties_sf", ext = "rds"))
+```
+
+Loaded intermediate and final outputs from `data/fema/`.
+
+# Feature 1 - Dataset: Indigenous Community Search
+
+One row per Indigenous community. The EDA-declaration columns are
+emitted as three slots (`_1`, `_2`, `_3`) populated with the three most
+recent qualifying declarations.
+
+```{r feature1-search-spec}
+final_columns_search = c(
+  "community_id", ## a unique identifier for the community
+  "community_name", ## name of the community
+  "community_name_short", ## shortened community name (<=9 words where possible) for narrow/mobile displays
+  "community_state", ## primary state in which the community is located (postal abbrev)
+  "community_edr", ## EDA Economic Development Representative for the state (semicolon-joined when a state has multiple)
+  "community_edr_email", ## email address of the EDR (semicolon-joined when a state has multiple; order matches `community_edr`)
+  "eda_factor_eligibility", ## "yes" if any declaration dated 2023-2024 reaches the community by any path; "no" otherwise (re-derived within the EDA window, not read off the 2014-2026 tier)
+  ## Three most-recent declarations in the 2023-2024 EDA window, slot 1 = most recent:
+  "eda_declaration_name_1",
+  "eda_declaration_name_2",
+  "eda_declaration_name_3",
+  "eda_declaration_year_1",
+  "eda_declaration_year_2",
+  "eda_declaration_year_3",
+  ## FEMA disaster number of the declaration in each slot:
+  "eda_declaration_disaster_number_1",
+  "eda_declaration_disaster_number_2",
+  "eda_declaration_disaster_number_3",
+  ## Up to three counties named in slot N's declaration, formatted "County, ST" and joined with "; ":
+  "eda_spatial_intersection_counties_1",
+  "eda_spatial_intersection_counties_2",
+  "eda_spatial_intersection_counties_3",
+  "fema_hmgp_binary",
+  "fema_hmgp_lead_applicant_declaration_binary",
+  "fema_hmgp_lead_applicant_state_year",
+  "sba_binary" ## "yes" if a qualifying-tier declaration's incident end date falls in 2025 or 2026
+  )
+```
+
+```{r feature1-search-build}
+source(here("scripts", "feature_1", "05_build_feature1_search.R"))
+source(here("scripts", "feature_1", "07_get_feature1_search_codebook.R"))
+
+feature1_search <- build_feature1_search(
+  eligibility_detail = results_detail,
+  classified_declarations = classified,
+  counties_sf = counties_sf)
+
+## Communities with no state cannot be assigned an EDA regional director, so
+## they are excluded from the search dataset. This should never happen: warn
+## loudly rather than letting a community disappear from the published file.
+feature1_search_missing_state = feature1_search %>%
+  filter(is.na(community_state))
+
+if (nrow(feature1_search_missing_state) > 0) {
+  warning(
+    "Excluding ", nrow(feature1_search_missing_state),
+    " community/communities from the search dataset for a missing state: ",
+    str_c(feature1_search_missing_state$community_name, collapse = "; "),
+    call. = FALSE)
+}
+
+feature1_search_data = feature1_search %>%
+  mutate(across(matches("binary"), ~ case_when(.x == "yes" ~ 1, .x == "no" ~ 0, TRUE ~ 99))) %>%
+  filter(!is.na(community_state))
+
+feature1_search_codebook = get_feature1_search_codebook()
+
+stopifnot(setequal(colnames(feature1_search_data), feature1_search_codebook$variable))
+stopifnot(setequal(colnames(feature1_search_data), final_columns_search))
+
+colnames(feature1_search_data)[!colnames(feature1_search_data) %in% final_columns_search]
+final_columns_search[!final_columns_search %in% colnames(feature1_search_data)]
+```
+
+# Feature 1 - Dataset: Indigenous Community Disasters (Data Visualization)
+
+```{r}
+final_columns_data_visualization = c(
+  "community_id",
+  "community_name",
+  "community_name_short",
+  "disaster_id",
+  "disaster_title",
+  "disaster_year_declared",
+  "disaster_type",
+  "disaster_designated_area",
+  "disaster_lead_applicant")
+```
+
+```{r feature1-data-visualization-build}
+source(here("scripts", "feature_1", "06_build_feature1_data_visualization.R"))
+source(here("scripts", "feature_1", "08_get_feature1_data_visualization_codebook.R"))
+
+## Display formatting ("State of <name>", "Statewide declaration",
+## " (Tribal area)" tags) is applied inside
+## build_feature1_data_visualization(), so the shipped CSV and the codebook
+## describe the same values.
+feature1_data_visualization <- build_feature1_data_visualization(
+    eligibility_detail = results_detail,
+    classified_declarations = classified,
+    counties_sf = counties_sf)
+
+feature1_data_visualization_codebook <- get_feature1_data_visualization_codebook()
+
+stopifnot(setequal(
+  colnames(feature1_data_visualization),
+  feature1_data_visualization_codebook$variable))
+```
+
+## Validation and write
+
+```{r feature1-validate-and-write}
+#' Stop when a column that must always be populated contains missing values
+#'
+#' @param data Tibble. The deliverable being checked.
+#' @param required_columns Character vector. Columns that must be complete.
+#' @param dataset_label Character. Name of the deliverable, used in the error.
+#' @return `invisible(NULL)`. Called for the error it raises.
+stop_on_missing_required_values = function(data,
+                                           required_columns,
+                                           dataset_label) {
+  missing_counts = data %>%
+    summarize(across(all_of(required_columns), ~ sum(is.na(.x)))) %>%
+    pivot_longer(everything(), names_to = "column", values_to = "n_missing") %>%
+    filter(n_missing > 0)
+
+  if (nrow(missing_counts) > 0) {
+    stop(
+      "Missing values in required column(s) of the ", dataset_label, ": ",
+      str_c(missing_counts$column, " (", missing_counts$n_missing, ")",
+            collapse = "; "),
+      call. = FALSE)
+  }
+  invisible(NULL)
+}
+
+## Every community in the universe reaches the search deliverable. The search
+## data drops any community with no state, so a community losing its state
+## upstream shows up here as a hard failure rather than a quiet omission.
+communities_missing_from_search_data = setdiff(
+  results_detail$community_id, feature1_search_data$community_id)
+communities_added_to_search_data = setdiff(
+  feature1_search_data$community_id, results_detail$community_id)
+
+if (length(communities_missing_from_search_data) > 0) {
+  stop(
+    "Communities in the resolved universe are missing from the search data: ",
+    str_c(communities_missing_from_search_data, collapse = ", "),
+    call. = FALSE)
+}
+if (length(communities_added_to_search_data) > 0) {
+  stop(
+    "Communities in the search data are absent from the resolved universe: ",
+    str_c(communities_added_to_search_data, collapse = ", "),
+    call. = FALSE)
+}
+
+## Every community appearing in the visualization data also appears in the
+## search data. This is containment rather than set equality, because a
+## community with no declarations in the 2014-2026 window has no visualization
+## rows at all while still belonging in the search data. It catches a community
+## being dropped from one deliverable but not the other — the failure that
+## removed "Pulikla Tribe of Yurok People" from the search data while leaving
+## its five visualization rows in place.
+communities_missing_from_search = setdiff(
+  feature1_data_visualization$community_id,
+  feature1_search_data$community_id)
+
+if (length(communities_missing_from_search) > 0) {
+  stop(
+    "Communities present in the visualization data are missing from the ",
+    "search data: ",
+    str_c(communities_missing_from_search, collapse = ", "),
+    call. = FALSE)
+}
+
+## The search deliverable is one row per community, so a duplicated key means
+## a join upstream fanned out and inflated the published file.
+duplicated_search_community_ids = feature1_search_data$community_id[
+  duplicated(feature1_search_data$community_id)]
+
+if (length(duplicated_search_community_ids) > 0) {
+  stop(
+    "Duplicated community_id in the search data: ",
+    str_c(unique(duplicated_search_community_ids), collapse = ", "),
+    call. = FALSE)
+}
+
+## Columns that carry no meaning when empty: identifiers, display names, and
+## the state that drives the EDR assignment. The declaration-slot columns are
+## deliberately excluded — they are NA whenever a community has fewer than
+## three qualifying declarations.
+stop_on_missing_required_values(
+  feature1_search_data,
+  c("community_id", "community_name", "community_name_short",
+    "community_state"),
+  "search data")
+stop_on_missing_required_values(
+  feature1_data_visualization,
+  c("community_id", "disaster_id", "disaster_year_declared"),
+  "visualization data")
+
+## All four deliverables are written together, only once every check above
+## has passed.
+snapshot_date = Sys.Date() %>% str_replace_all("-", "_")
+interim_dir = here("data", "interim")
+if (!dir.exists(interim_dir)) dir.create(interim_dir, recursive = TRUE)
+interim_path = function(stem) {
+  file.path(interim_dir, str_c(stem, "_", snapshot_date, ".csv"))
+}
+write_csv(feature1_search_data, interim_path("feature1_search_data"))
+write_csv(feature1_search_codebook, interim_path("feature1_search_codebook"))
+write_csv(feature1_data_visualization,
+          interim_path("feature1_data_visualization"))
+write_csv(feature1_data_visualization_codebook,
+          interim_path("feature1_data_visualization_codebook"))
+```

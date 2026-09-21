@@ -1,0 +1,812 @@
+---
+title: "Feature 2 — Figures"
+format:
+  html:
+    toc: true
+    fig-width: 8
+    fig-height: 5
+execute:
+  warning: false
+  message: false
+---
+
+Builds the figures for feature 2 from feature-1 outputs plus additional FEMA and Census sources. Each figure's data preparation lives in a `figure_*.R` / `get_*.R` script in this
+folder, all sourced by the setup chunk below; this document then aggregates,
+plots, and writes each figure and its codebook to `outputs/`.
+
+## Setup
+```{r setup}
+library(arrow)
+library(tidyverse)
+library(sf)
+library(here)
+library(janitor)
+library(urbnthemes)
+library(ggbeeswarm)
+
+set_urbn_defaults(style = "print")
+
+options(scipen = 999)
+
+## source R files within feature_2 subfolder
+list.files(here("scripts", "feature_2"), full.names = TRUE) %>%
+  keep(~ str_detect(.x, "\\.R$")) %>%
+  walk(source)
+
+## CSV exports of plot data + codebooks live under outputs/data/.
+dir.create(here("outputs", "data"), showWarnings = FALSE, recursive = TRUE)
+
+## Clear all previously exported figure_<n>_* CSVs
+list.files(
+    here("outputs", "data"),
+    pattern = "^figure_.*\\.csv$",
+    full.names = TRUE) %>%
+  walk(file.remove)
+
+write_figure_data = function(id, data) {
+  readr::write_csv(data, here("outputs", "data", str_c("figure_", id, "_data.csv")))
+}
+
+write_figure_codebook = function(figure_number, codebook) {
+  readr::write_csv(
+    codebook,
+    here("outputs", "data", str_c("figure_", figure_number, "_codebook.csv")))
+}
+
+## For figures whose histograms carry vertical reference lines (a mean or
+## median), write one CSV per figure with a row per line. Columns are
+## `statistic` (the summary type, e.g. "mean" or "median"), `label` (the
+## exact legend text drawn on the plot), and `value` (the numeric
+## x-intercept).
+write_figure_reference_lines = function(figure_number, reference_lines) {
+  stopifnot(all(c("statistic", "label", "value") %in% names(reference_lines)))
+  readr::write_csv(
+    reference_lines %>% dplyr::select(statistic, label, value),
+    here("outputs", "data", str_c("figure_", figure_number, "_reference_lines.csv")))
+}
+
+relabel_territories = function(x) {
+  if_else(x == "Territories", "US territories", x)
+}
+
+## Get the most recent snapshot for a data/fema/ artifact.
+latest_rds <- function(stem) {
+  tibble(path = list.files(
+    here("data", "fema"),
+    pattern = str_c("^", stem, "_\\d{4}_\\d{2}_\\d{2}\\.rds$"),
+    full.names = TRUE)) %>%
+    mutate(snapshot_date = path %>%
+             str_extract("\\d{4}_\\d{2}_\\d{2}") %>%
+             str_replace_all("_", "-") %>%
+             ymd()) %>%
+    slice_max(snapshot_date, n = 1) %>%
+    pull(path)
+}
+```
+
+## Figure 1 - SHELDUS Damages
+```{r figure-1}
+inclusion_year = 2015
+## Community-level (one row per AIANNH × year × hazard) with region/division
+## and population_2020 attached.
+figure_1_data_raw = prepare_figure_1_data() %>%
+    ## `state_name` comes from a left join on each community's primary state;
+    ## an NA would mean a community failed that join, and `!= "Hawaii"` alone
+    ## would silently drop it. Warn and keep such rows instead.
+    { if (any(is.na(.$state_name)))
+        warning("prepare_figure_1_data() returned rows with NA state_name; these are retained, not treated as Hawaii.")
+      . } %>%
+    filter(
+      state_name != "Hawaii" | is.na(state_name),
+      year >= inclusion_year) %>%
+    ## Chart-text convention: sentence case with no slashes ("/" -> " or ").
+    ## Normalize `hazard` here so every downstream figure-1 aggregation,
+    ## factor level, and exported CSV inherits the cleaned labels (e.g.
+    ## "Hurricane/Tropical Storm" -> "Hurricane or tropical storm").
+    mutate(hazard = str_to_sentence(str_replace_all(hazard, "/", " or ")))
+
+indigenous_sheldus_total_hazards = figure_1_data_raw %>%
+  summarize(.by = hazard, damage_total = sum(damage_total, na.rm = TRUE)) %>%
+  arrange(desc(damage_total)) %>%
+  as_tibble()
+
+n_top_hazards = 6
+
+top_n_hazards = indigenous_sheldus_total_hazards %>%
+  slice_max(damage_total, n = n_top_hazards, with_ties = FALSE) %>%
+  pull(hazard)
+
+annual_hazard_totals = figure_1_data_raw %>%
+  mutate(
+    territory_flag = if_else(region == "Territories", "Territories", "Federally-recognized tribes and ANVs")) %>%
+  summarize(
+    .by = c(hazard, year, territory_flag),
+    damage_total = sum(damage_total, na.rm = TRUE)) %>%
+  arrange(year) %>%
+  mutate(
+    .by = c(hazard, territory_flag),
+    damage_total_cumulative = cumsum(damage_total))
+
+## hazard-specific damages by region range enormously
+figure_1_data = figure_1_data_raw %>%
+  summarize(
+    .by = c(hazard, region),
+    damage_total_millions = sum(damage_total, na.rm = TRUE) / 1000000) %>%
+  filter(
+    .by = hazard,
+    !(all(damage_total_millions < 10))) %>%
+  arrange(desc(damage_total_millions)) %>%
+  mutate(
+    ## A hazard-region cell can be absent from this grid (SHELDUS has no
+    ## record of the hazard in the region's Indigenous-community tracts) or
+    ## sum to $0 (records exist but report zero — or unquantified —
+    ## damages). Both mean "no recorded damages", so convert $0 to NA here.
+    damage_total_millions = if_else(damage_total_millions == 0, NA_real_, damage_total_millions),
+    damage_categories = cut(
+      damage_total_millions,
+      breaks = c(-Inf, 10, 50, 250, 750, Inf),
+      ordered_result = TRUE,
+      labels = c("<$10M", "<$50M", "<$250M", "<$750M", "$750M+")))
+
+figure_1_data %>%
+  summarize(.by = region, damage_total_millions = sum(damage_total_millions, na.rm = TRUE))
+
+(figure1 = figure_1_data %>%
+  filter(!is.na(damage_categories)) %>%
+  mutate(region = relabel_territories(region)) %>%
+  ggplot() +
+    geom_tile(
+      aes(x = region, y = hazard, fill = damage_categories)) +
+    theme_urbn_print() +
+    theme(panel.grid.major = element_blank()) +
+    labs(x = "Region", y = "", fill = "Damages"))
+
+ggsave(here("outputs", "figure1.png"), dpi = 300, width = 6.5, height = 3, plot = figure1)
+```
+
+## Figure 2 — Distribution of Major Disaster Declarations
+```{r figure-2}
+## Derive `home_state` per community from `state_list` (a list-column on
+## `universe_sf`). Feature 2's universe excludes both
+## HHL and ANRC, so keep only the federally-recognized tribes/ANVs and the
+## territorial county-equivalents.
+universe_sf <- readRDS(latest_rds("feature_1_universe_sf")) %>%
+  filter(recognition_status %in% c("federal", "territory")) %>%
+  mutate(home_state = map_chr(state_list, function(sl) {
+    sl = unique(unlist(sl))
+    prefer = intersect(c("AK", "HI", "AS", "GU", "MP"), sl)
+    if (length(prefer) > 0) prefer[1] else if (length(sl) > 0) sl[1] else NA_character_
+  }))
+counties_sf <- readRDS(latest_rds("feature_1_counties_sf"))
+
+figure_2_data <- prepare_figure_2_data(
+  universe_sf = universe_sf,
+  counties_sf = counties_sf,
+  year_range = 2016:2025,
+  coverage_threshold = 0.5)
+
+## Aggregate observation-level data to one row per unit (community or county)
+## for the histogram and reference lines.
+tribe_representative_geoids <- get_aiannh_tribe_crosswalk(year = 2024) %>%
+  distinct(tribe_name, representative_geoid) %>%
+  transmute(
+    bia_name = tribe_name %>%
+      str_replace("^PuliklaTribe\\b", "Pulikla Tribe") %>%
+      str_replace("^The\\s+", ""),
+    target_geoid = representative_geoid)
+
+if (anyDuplicated(tribe_representative_geoids$bia_name) > 0) {
+  stop("Figure 2: display normalization collapsed two Federal Register names ",
+       "to one key, so the representative-geoid join is ambiguous.")
+}
+
+community_counts <- universe_sf %>%
+  sf::st_drop_geometry() %>%
+  as_tibble() %>%
+  distinct(community_id, name, bia_name, recognition_status, home_state) %>%
+  tidylog::left_join(
+    tribe_representative_geoids,
+    by = "bia_name",
+    relationship = "many-to-one") %>%
+  ## Territorial `community_id`s already carry the county-equivalent FIPS
+  ## (e.g. "territory_GU_66010"); landless federally-recognized tribes have no
+  ## AIANNHCE polygon and so keep an NA target_geoid.
+  mutate(
+    target_geoid = if_else(
+      recognition_status == "territory",
+      str_extract(community_id, "[0-9]{5}$"),
+      target_geoid)) %>%
+  select(-bia_name) %>%
+  left_join(
+    figure_2_data %>%
+      filter(unit_type == "community") %>%
+      distinct(unit_id, incident_begin_date, incident_type) %>%
+      summarize(.by = unit_id, n_disasters = n()),
+    by = c("community_id" = "unit_id"),
+    relationship = "one-to-one") %>%
+  mutate(n_disasters = coalesce(n_disasters, 0L)) %>%
+  rename(unit_id = community_id) %>%
+  arrange(n_disasters)
+
+## Landless federally-recognized tribes have no AIANNHCE, so they are the
+## expected NAs here; anything else means the name join failed.
+n_missing_geoid <- sum(is.na(community_counts$target_geoid))
+if (n_missing_geoid > 0) {
+  message(
+    "Figure 2: ", n_missing_geoid, " of ", nrow(community_counts),
+    " communities have no target_geoid (federally-recognized tribes with no ",
+    "AIANNHCE polygon).")
+}
+
+## County mean/median are computed over all US counties (excl. PR/VI),
+## including counties with zero in-window declarations.
+all_counties <- counties_sf %>%
+  janitor::clean_names() %>%
+  sf::st_drop_geometry() %>%
+  as_tibble() %>%
+  filter(!stusps %in% c("PR", "VI")) %>%
+  distinct(geoid)
+
+county_counts <- all_counties %>%
+  left_join(
+    figure_2_data %>%
+      filter(unit_type == "county") %>%
+      distinct(unit_id, incident_begin_date, incident_type) %>%
+      summarize(.by = unit_id, n_disasters = n()),
+    by = c("geoid" = "unit_id"),
+    relationship = "one-to-one") %>%
+  mutate(n_disasters = coalesce(n_disasters, 0L))
+
+county_mean    <- mean(county_counts$n_disasters)
+community_mean <- mean(community_counts$n_disasters)
+
+(figure2 <- plot_figure_2_distribution_declarations(
+  community_counts = community_counts,
+  county_mean = county_mean,
+  community_mean = community_mean))
+
+ggsave(here("outputs", "figure2.png"), dpi = 300, width = 6.5, height = 3, plot = figure2)
+```
+
+## Figure 3 - Per Capita Estimated Annual Losses
+```{r figure-3}
+#| label: fig-3
+nri_data = get_nri()
+
+## `get_nri()` returns a two-element list: [[1]] = indigenous_nri, one row per
+## target geography — AIANNH for tribal rows, territorial county-equivalent
+## for territorial rows (AS: 5 districts, GU: 1, MP: 4 municipalities, for 10
+## territorial rows in total); [[2]] = county_nri, one row per US county
+## taken directly from FEMA's published county-level NRI table (not a tract
+## aggregation), used for the reference-line baselines (Puerto Rico and USVI
+## excluded per project policy, matching figure 2's county baseline).
+indigenous_nri = nri_data[[1]]
+county_nri = nri_data[[2]]
+
+## Restrict to the plotted universe: three territorial county-equivalents
+## (Rose Island and Swains Island in American Samoa, the Northern Islands in
+## the CNMI — all essentially unpopulated) have no NRI-covered tracts, so
+## their per-capita EAL is 0/0. Drop them explicitly so the figure, the
+## exported CSV, the reference lines, and the community-count QC all
+## describe the same universe, rather than letting geom_histogram() drop
+## them silently.
+## Cap per-capita EAL at $10K for the histogram x-axis; the uncapped value
+## is preserved alongside so the saved data reflects what was plotted.
+## `community_type` is a display-only facet label (sentence case per the
+## chart-text convention); the canonical `territory_flag` column is retained
+## unchanged. Alaska is pulled into its own facet, so the residual facet is
+## labeled for what it still contains — non-Alaska federally recognized
+## tribes (feature 2's universe has no Hawaii rows).
+figure_3_data = indigenous_nri %>%
+  filter(is.finite(eal_per_capita)) %>%
+  mutate(
+    community_type = case_when(
+      home_state == "AK" ~ "Alaska Native communities",
+      territory_flag == "Territories" ~ "US territories",
+      TRUE ~ "Federally recognized tribes in the contiguous US"),
+    eal_per_capita_adjusted = if_else(eal_per_capita > 10000, 10000, eal_per_capita))
+
+county_eal_mean = mean(county_nri$eal_per_capita, na.rm = TRUE)
+indigenous_eal_mean = mean(figure_3_data$eal_per_capita, na.rm = TRUE)
+
+most_impacted_communities = figure_3_data %>%
+  arrange(desc(eal_per_capita)) %>%
+  slice(1:15) %>%
+  pull(target_geoid)
+
+## communities with the highest per-capita damages
+indigenous_nri %>%
+  filter(target_geoid %in% most_impacted_communities) %>%
+  pivot_longer(cols = matches("ealt$|evnts")) %>%
+  select(target_geoid, target_geography_name, population_crosswalked, name, value) %>%
+  mutate(value_per_capita = value/population_crosswalked) %>%
+  group_by(target_geoid) %>%
+  filter(any(value_per_capita > 100)) %>%
+  select(-target_geography_name, -value) %>%
+  arrange(target_geoid, desc(value_per_capita)) %>%
+  ungroup() %>%
+  mutate(.by = target_geoid, type = name[value_per_capita == max(value_per_capita, na.rm = TRUE)][1]) %>%
+  mutate(type = str_remove(type, "_.*")) %>%
+  filter(str_detect(name, type)) %>%
+  print(n = Inf)
+
+(figure3 = figure_3_data %>%
+  ggplot(aes(x = eal_per_capita_adjusted)) +
+    geom_histogram(
+      #aes(color = community_type),
+      # fill = NA,
+      #fill = palette_urbn_main[1], 
+      bins = 60, boundary = 0) +
+    geom_vline(aes(xintercept = county_eal_mean, linetype = "Average, all US counties"), linewidth = 0.8) +
+    geom_vline(aes(xintercept = indigenous_eal_mean, linetype = "Average, Indigenous communities"), linewidth = 0.8) +
+    # scale_linetype_manual(
+    #   name = NULL,
+    #   values = c("Average, all US counties" = "dashed", "Average, Indigenous communities" = "solid")) +
+    scale_x_continuous(labels = scales::dollar_format()) +
+    labs(
+      x = "Estimated annual loss per capita",
+      y = "Number of Indigenous communities") +
+    theme_urbn_print()) #+
+    #facet_wrap(~ community_type, ncol = 1))
+
+ggsave(here("outputs", "figure3.png"), dpi = 300, width = 6.5, height = 3, plot = figure3)
+```
+
+## Figure 4 - Distribution of Indigenous Community Risk Scores
+```{r figure-4}
+#| label: fig-4
+## Reuses `indigenous_nri` / `county_nri` derived from the figure-3 chunk.
+## The county baseline comes from FEMA's published county-level NRI table,
+## where risk scores are percentile ranks computed among counties (median
+## ~50 by construction). 
+indigenous_risk_median = median(indigenous_nri$risk_score, na.rm = TRUE)
+county_risk_median = median(county_nri$risk_score, na.rm = TRUE)
+
+## NRI does not score AS/GU/MP tracts, so all 10 territorial county-equivalents
+## have NA risk_score — figure 4 therefore contains zero territorial
+## communities.
+figure_4_data = indigenous_nri %>%
+  select(target_geoid, target_geography_name, territory_flag, risk_score) %>%
+  filter(!is.na(risk_score))
+
+highest_risk_communities = figure_4_data %>%
+  arrange(desc(risk_score)) %>%
+  slice(1:15) %>%
+  pull(target_geoid)
+
+highest_risk_communities %in% most_impacted_communities %>% table()
+
+indigenous_nri %>%
+  filter(target_geoid %in% highest_risk_communities) %>%
+  select(target_geoid, matches("score|per_capita"), home_state) %>%
+  mutate(most_impacted = if_else(target_geoid %in% most_impacted_communities, 1 ,0))
+
+(figure4 = figure_4_data %>%
+  ggplot(aes(x = risk_score)) +
+    geom_histogram(bins = 40) +
+    geom_vline(aes(xintercept = county_risk_median, linetype = "Median, all US counties")) +
+    geom_vline(aes(xintercept = indigenous_risk_median, linetype = "Median, Indigenous communities")) +
+    scale_linetype_manual(
+      name = NULL,
+      values = c("Median, all US counties" = "dashed", "Median, Indigenous communities" = "solid")) +
+    labs(
+      x = "NRI risk score",
+      y = "Number of Indigenous communities") +
+    theme_urbn_print())
+
+ggsave(here("outputs", "figure4.png"), dpi = 300, width = 6.5, height = 3, plot = figure4)
+```
+
+
+## Figure 5 - Awarded Recovery Funding by Program
+```{r figure-5}
+figure_5_data = prepare_figure_5_data() %>%
+  filter(year_declared > 2014)
+
+## Aggregate per-community rows to year x source for the stacked bar.
+figure_5_annual = figure_5_data %>%
+  summarize(
+    .by = c(year_declared, type),
+    amount = sum(amount, na.rm = TRUE)) %>%
+  mutate(type = if_else(type == "ihp", "IHP", "PA"))
+
+## The March 2026 OpenFEMA snapshots observe declaration-year 2026 for only
+## ~2 months, and IHP payouts / PA obligations for the most recent
+## declaration years are still accruing, so the newest bars understate
+## final totals. (Suppressed in the rendered doc by `warning: false`;
+## visible when running interactively.)
+if (max(figure_5_annual$year_declared, na.rm = TRUE) >= 2025) {
+  warning(
+    "Figure 5: the most recent declaration years (through ",
+    max(figure_5_annual$year_declared, na.rm = TRUE),
+    ") are incompletely observed in the March 2026 OpenFEMA snapshots; ",
+    "the newest bars understate final totals.")
+}
+
+(figure_5_plot = figure_5_annual %>%
+  ggplot() +
+    geom_col(aes(x = year_declared, y = amount / 1000000, fill = type)) +
+    theme_urbn_print() +
+    scale_y_continuous(labels = scales::label_currency(suffix = "M")) +
+    scale_x_continuous(breaks = c(2015, 2020, 2025)) +
+    labs(x = "Year of disaster declaration", y = "", fill = "Program"))
+
+## Territories vs federally-recognized tribes and ANVs, faceted.
+figure_5_annual_by_flag = figure_5_data %>%
+  filter(year_declared > 2014) %>%
+  summarize(
+    .by = c(year_declared, type, territory_flag),
+    amount = sum(amount, na.rm = TRUE)) %>%
+  mutate(type = if_else(type == "ihp", "IHP", "PA"))
+
+(figure_5_plot_by_flag = figure_5_annual_by_flag %>%
+  mutate(territory_flag = relabel_territories(territory_flag)) %>%
+  ggplot() +
+    geom_col(aes(x = year_declared, y = amount / 1000000, fill = type)) +
+    facet_wrap(~ territory_flag, scales = "free_y") +
+    theme_urbn_print() +
+    scale_y_continuous(labels = scales::label_currency(suffix = "M")) +
+    scale_x_continuous(breaks = c(2015, 2020, 2025)) +
+    labs(x = "Year of disaster declaration", y = "", fill = "Program"))
+
+ggsave(here("outputs", "figure5.png"), dpi = 300, width = 6.5, height = 3, plot = figure_5_plot_by_flag)
+```
+
+## Figure 6 - SBA Approved Loan Amounts
+```{r figure-6}
+figure_6_data = prepare_figure_6_data()
+
+figure_6_plot_data = figure_6_data %>%
+  filter(
+    fiscal_year > 2012,
+    approved_amount_total != 0) %>%
+  mutate(loan_type = str_to_sentence(loan_type)) %>%
+  summarize(
+    .by = c(fiscal_year, loan_type, territory_flag),
+    approved_amount_total = sum(approved_amount_total))
+
+figure_6_plot_data %>%
+  summarize(approved_amount_total = sum(approved_amount_total))
+
+(figure6 = figure_6_plot_data %>%
+  mutate(territory_flag = relabel_territories(territory_flag)) %>%
+  ggplot() +
+    geom_col(aes(x = fiscal_year, y = approved_amount_total, fill = loan_type)) +
+    urbnthemes::theme_urbn_print() +
+    scale_y_continuous(labels = scales::label_currency(suffix = "M", scale = .000001)) +
+    labs(x = "Fiscal year", y = "Approved loan amounts", fill = "Loan type") +
+    facet_wrap(~ territory_flag))
+
+ggsave(here::here("outputs", "figure6.png"), dpi = 300, width = 6.5, height = 3, plot = figure6)
+```
+
+## Figure 7 - Awarded HMA Funding by Program
+```{r figure-7}
+## prepare_figure_7_data() windows both sources to 2000-2026 internally;
+## the figure, the exported CSV, the community-count QC, and the summaries
+## below all describe that same window.
+figure_7_data_all <- prepare_figure_7_data()
+
+## FMA is excluded from figure 7 — the plot, the exported CSV, and the
+## community-count QC all use this object.
+figure_7_plot_data = figure_7_data_all %>%
+  filter(program != "FMA")
+
+## tribal-only BRIC awards = $200 million
+#figure_7_plot_data %>% 
+  # filter(!str_detect(territory_flag, "Territories")) %>%
+  # filter(program == "BRIC") %>%
+  # summarize(
+  #   sum(federal_share_amount, na.rm = TRUE))
+
+
+## Year 2026 is observed for only ~2 months in the March 2026 snapshots
+## (and v4 obligations for recent years are still accruing), so the newest
+## bars understate final totals.
+if (max(figure_7_plot_data$year_submitted, na.rm = TRUE) >= 2026) {
+  warning(
+    "Figure 7: year 2026 is incompletely observed in the March 2026 ",
+    "OpenFEMA snapshots; the newest bar understates the year's eventual ",
+    "total.")
+}
+
+figure_7_data_all %>%
+  summarize(
+    .by = program,
+    federal_share_amount = sum(federal_share_amount, na.rm = TRUE)) %>%
+  mutate(percent = federal_share_amount / sum(federal_share_amount))
+
+figure_7_plot_data %>%
+  summarize(
+    .by = territory_flag,
+    federal_share_amount = sum(federal_share_amount, na.rm = TRUE))
+
+(figure_7_plot = figure_7_plot_data %>%
+    mutate(territory_flag = relabel_territories(territory_flag)) %>%
+    ggplot(aes(
+      x = year_submitted,
+      y = federal_share_amount,
+      fill = program)) +
+      geom_col() +
+      scale_x_continuous(breaks = unique(figure_7_plot_data$year_submitted)) +
+      scale_y_continuous(
+        labels = scales::label_currency(scale_cut = scales::cut_short_scale()),
+        expand = expansion(mult = c(0, 0.05))) +
+      labs(
+        x = "Year submitted",
+        y = "Federal funding",
+        fill = NULL) +
+      facet_wrap(~territory_flag) +
+      urbnthemes::theme_urbn_print())
+    
+ggsave(here("outputs", "figure7.png"), dpi = 300, width = 6.5, height = 3, plot = figure_7_plot)
+```
+
+## In-text statistics
+
+All numbers quoted in the narrative, plus the cross-figure community-count QC,
+are produced here from objects defined in the figure chunks above. Step through
+the figures first; this section is the last stop.
+
+Each claim below is computed in its own chunk from the native objects defined
+in the figure chunks above (not from the exported CSVs), then inlined into the
+paragraph that follows it.
+
+```{r claim-total-damages}
+## All hazards, including the minor ones the figure-1 grid filters out
+## (which bring the total to ~$4.36B), so this runs slightly above the
+## figure_1_data.csv sum ($4.33B).
+claim_total_damages_billions = round(
+  sum(figure_1_data_raw$damage_total, na.rm = TRUE) / 1e9, 2)
+```
+
+Between 2015 and 2024, Indigenous communities in the US and its territories experienced an estimated \$`r claim_total_damages_billions` billion in damages to property and crops from natural disasters.
+
+```{r claim-damages-by-recognition}
+claim_fed_damages_billions = figure_1_data_raw %>%
+  filter(region != "Territories") %>%
+  summarize(damage_total = sum(damage_total, na.rm = TRUE)) %>%
+  pull(damage_total) %>%
+  `/`(1e9) %>%
+  round(2)
+
+claim_fed_top_hazards = figure_1_data_raw %>%
+  filter(region != "Territories") %>%
+  summarize(.by = hazard, damage_total = sum(damage_total, na.rm = TRUE)) %>%
+  slice_max(damage_total, n = 2) %>%
+  mutate(
+    hazard = str_to_lower(hazard),
+    damage_millions = round(damage_total / 1e6))
+
+claim_territory_cyclone_billions = figure_1_data_raw %>%
+  filter(region == "Territories", hazard == "Hurricane or tropical storm") %>%
+  summarize(damage_total = sum(damage_total, na.rm = TRUE)) %>%
+  pull(damage_total) %>%
+  `/`(1e9) %>%
+  round(2)
+```
+
+Federally recognized tribes and ANVs experienced an estimated \$`r claim_fed_damages_billions` billion in damages to property and crops between 2015 and 2024, with `r claim_fed_top_hazards$hazard[1]`s (\$`r claim_fed_top_hazards$damage_millions[1]` million) and `r claim_fed_top_hazards$hazard[2]` (\$`r claim_fed_top_hazards$damage_millions[2]` million) ranking as the costliest hazards. The territories of Guam, American Samoa, and the Northern Mariana Islands experienced approximately \$`r claim_territory_cyclone_billions` billion in damages from tropical cyclones, which include typhoons or hurricanes.
+
+```{r claim-regional-pattern}
+## Costliest hazard per region, supporting the qualitative regional claim.
+(claim_region_top_hazards = figure_1_data_raw %>%
+  summarize(
+    .by = c(region, hazard),
+    damage_total = sum(damage_total, na.rm = TRUE)) %>%
+  slice_max(damage_total, n = 1, by = region))
+
+claim_west_top_hazard = claim_region_top_hazards %>%
+  filter(region == "West") %>%
+  pull(hazard) %>%
+  str_to_lower()
+
+claim_alaska_top_hazard = claim_region_top_hazards %>%
+  filter(region == "Alaska") %>%
+  pull(hazard) %>%
+  str_to_lower()
+```
+
+Damages vary significantly across regions. We find that from 2015 to 2024, federally recognized tribes in the US South experienced high levels of damages from nearly all major hazards. Tribes in the West were most affected by `r claim_west_top_hazard`s, while the primary hazard in ANVs was `r claim_alaska_top_hazard`.
+
+```{r claim-share-and-multiple}
+## Damages (figure 1, 2015-2024) against IHP + PA recovery funding declared
+## over the same window (figure 5). Floored so rounding never overstates.
+claim_recovery_funding_2015_2024 = figure_5_data %>%
+  filter(year_declared <= 2024) %>%
+  summarize(amount = sum(amount, na.rm = TRUE)) %>%
+  pull(amount)
+
+claim_damages_to_funding_multiple = floor(
+  sum(figure_1_data_raw$damage_total, na.rm = TRUE) /
+    claim_recovery_funding_2015_2024)
+
+## National denominator: same SHELDUS source and 2024->2025 dollar
+## conversion figure 1 uses. (The in-text-statistics chunk below repeats
+## this pull for its own share statistic; keep the two in sync.)
+claim_national_damages_2015_2024 = get_sheldus() %>%
+  mutate(sheldus_dollar_year = 2024) %>%
+  adjust_dollars_to_2025(
+    year_variable = "sheldus_dollar_year",
+    dollar_variables = c("damage_property", "damage_crop")) %>%
+  filter(year >= 2015, year <= 2024) %>%
+  summarize(
+    damage_total = sum(
+      coalesce(damage_property, 0) + coalesce(damage_crop, 0))) %>%
+  pull(damage_total)
+
+claim_damage_share_pct = round(
+  sum(figure_1_data_raw$damage_total, na.rm = TRUE) /
+    claim_national_damages_2015_2024 * 100, digits = 2)
+```
+
+These damages in Indigenous communities represent a small share of total damages in the US (`r claim_damage_share_pct` percent) but amount to more than `r claim_damages_to_funding_multiple` times the federal disaster recovery grant funding Indigenous communities received over the same period from FEMA.
+
+```{r claim-non-indigenous-multiple}
+## Parallel statistic for all non-Indigenous US communities: national
+## damages minus the Indigenous total, over national IHP + PA minus the
+## Indigenous total, with the same 2015-2024 declaration-year window,
+## record-level filters, and 2025-USD conversion as the Indigenous
+## multiple above. Because the Indigenous totals subtracted here are the
+## territorial-scaled amounts, the non-NHPI share of territorial dollars
+## stays in the non-Indigenous bucket, consistent with the project's
+## territorial scaling convention.
+claim_national_ihp_pa_2015_2024 = prepare_national_ihp_pa_totals() %>%
+  filter(year_declared >= 2015, year_declared <= 2024) %>%
+  summarize(amount = sum(amount, na.rm = TRUE)) %>%
+  pull(amount)
+
+claim_non_indigenous_damages_2015_2024 = claim_national_damages_2015_2024 -
+  sum(figure_1_data_raw$damage_total, na.rm = TRUE)
+
+claim_non_indigenous_funding_2015_2024 = claim_national_ihp_pa_2015_2024 -
+  claim_recovery_funding_2015_2024
+
+## Same floor() treatment as the Indigenous multiple, so neither number is
+## overstated by rounding.
+claim_non_indigenous_multiple = floor(
+  claim_non_indigenous_damages_2015_2024 /
+    claim_non_indigenous_funding_2015_2024)
+```
+
+By comparison, damages in non-Indigenous US communities over the same period amounted to more than `r claim_non_indigenous_multiple` times the FEMA disaster recovery grant funding (IHP and PA) those communities received.
+
+```{r claim-repeat-disasters}
+claim_two_plus_share_pct = round(mean(community_counts$n_disasters >= 2) * 100)
+```
+
+Our analysis shows that since 2016, Indigenous communities have been frequently affected by major disasters, with more than half (`r claim_two_plus_share_pct` percent) of all Indigenous communities experiencing two or more presidentially declared disasters.
+
+```{r claim-compounding-disasters}
+claim_compounding_share_pct = figure_2_data %>%
+  filter(unit_type == "community") %>%
+  distinct(unit_id, incident_begin_date, incident_type) %>%
+  arrange(unit_id, incident_begin_date) %>%
+  mutate(
+    .by = unit_id,
+    two_year_flag = as.numeric(
+      incident_begin_date - lag(incident_begin_date) <= 730)) %>%
+  summarize(.by = unit_id, compounding = sum(two_year_flag, na.rm = TRUE)) %>%
+  filter(compounding > 0) %>%
+  nrow() %>%
+  `/`(n_distinct(community_counts$unit_id)) %>%
+  `*`(100) %>%
+  round()
+```
+
+About `r claim_compounding_share_pct` percent of these communities have experienced two or more disasters within a two-year span during the last decade. Back-to-back disasters can compound the difficulties communities face in responding and recovering because their economic and social infrastructures are already destabilized. These challenges underscore the need for communities to be prepared and have the resources to recover quickly.
+
+```{r claim-fema-recovery-totals}
+claim_fema_recovery = figure_5_annual %>%
+  summarize(.by = type, amount = sum(amount, na.rm = TRUE)) %>%
+  mutate(amount_millions = round(amount / 1e6))
+
+claim_fema_total_millions = round(sum(claim_fema_recovery$amount) / 1e6)
+claim_pa_millions = claim_fema_recovery %>% filter(type == "PA") %>% pull(amount_millions)
+claim_ihp_millions = claim_fema_recovery %>% filter(type == "IHP") %>% pull(amount_millions)
+```
+
+FEMA is the largest federal funder of disaster recovery in Indigenous communities. From 2015 to 2025, FEMA awarded approximately \$`r claim_fema_total_millions` million in recovery funding to federally recognized tribes, ANVs, and the territories of Guam, American Samoa, and the Northern Mariana Islands communities. This included roughly \$`r claim_pa_millions` million in Public Assistance (PA) funding for government entities and roughly \$`r claim_ihp_millions` million through the Individuals and Households Program (IHP), which provides recovery resources directly to households.
+
+```{r claim-sba-loans}
+claim_sba_total_millions = round(
+  sum(figure_6_plot_data$approved_amount_total) / 1e6)
+
+claim_sba_annual_millions = round(
+  claim_sba_total_millions /
+    (max(figure_6_plot_data$fiscal_year) - min(figure_6_plot_data$fiscal_year) + 1))
+
+claim_sba_2019_share_pct = figure_6_plot_data %>%
+  summarize(
+    share = sum(approved_amount_total[fiscal_year == 2019]) /
+      sum(approved_amount_total)) %>%
+  pull(share) %>%
+  `*`(100) %>%
+  round()
+```
+
+From 2013 to 2022, SBA made about \$`r claim_sba_total_millions` million in loans to businesses and households in Indigenous communities—an average of about \$`r claim_sba_annual_millions` million per year. More than half (`r claim_sba_2019_share_pct` percent) of the loan volume during this window was lent in fiscal year 2019, when SBA approved tens of millions of dollars each for disasters including Super Typhoon Yutu in the Northern Mariana Islands, severe storms and tornadoes in Oklahoma, and the Cook Inlet Earthquake in Alaska.
+
+```{r claim-hma-programs}
+claim_hmgp_2000_2019_millions = figure_7_plot_data %>%
+  filter(program == "HMGP", year_submitted <= 2019) %>%
+  summarize(amount = sum(federal_share_amount, na.rm = TRUE)) %>%
+  pull(amount) %>%
+  `/`(1e6) %>%
+  round(1)
+
+claim_bric_millions = figure_7_plot_data %>%
+  filter(program == "BRIC") %>%
+  summarize(amount = sum(federal_share_amount, na.rm = TRUE)) %>%
+  pull(amount) %>%
+  `/`(1e6) %>%
+  round()
+
+claim_bric_share_pct = figure_7_plot_data %>%
+  summarize(
+    share = sum(federal_share_amount[program == "BRIC"], na.rm = TRUE) /
+      sum(federal_share_amount, na.rm = TRUE)) %>%
+  pull(share) %>%
+  `*`(100) %>%
+  round()
+```
+
+Between 2000 and 2019, HMGP provided the largest share of mitigation funds to Indigenous communities, a total of \$`r claim_hmgp_2000_2019_millions` million. In more recent years, BRIC has significantly expanded Indigenous communities’ access to mitigation funding. Though Congress created it in 2018, and the first funding cycle wasn’t until fiscal year 2020, BRIC awards through 2026 account for \$`r claim_bric_millions` million. That’s more than half (`r claim_bric_share_pct` percent) of all hazard mitigation funds awarded to Indigenous communities from 2000 to 2026.
+
+## Chart-only data exports
+
+Writes the data behind every figure to one workbook,
+`outputs/data/feature_2/feature_2_figure_data.xlsx`, with one sheet per
+figure. The average/median reference lines drawn on figures 2-4 are not
+included.
+
+```{r chart-data-exports}
+feature_2_export_directory = here("outputs", "data", "feature_2")
+dir.create(feature_2_export_directory, showWarnings = FALSE, recursive = TRUE)
+
+feature_2_figure_data = list(
+  ## Figure 1: tile grid.
+  figure_1 = figure_1_data %>%
+    select(region, hazard, damage_total_millions, damage_categories) %>%
+    arrange(region, hazard),
+
+  ## Figure 2: histogram of one count per community.
+  figure_2 = community_counts %>%
+    select(target_geoid, unit_id, name, n_disasters) %>%
+    arrange(desc(n_disasters)),
+
+  ## Figure 3: histogram of the capped per-capita loss (the uncapped value is
+  ## not what the x-axis shows).
+  figure_3 = figure_3_data %>%
+    select(target_geoid, target_geography_name, eal_per_capita_adjusted, eal_per_capita) %>%
+    arrange(eal_per_capita_adjusted),
+
+  ## Figure 4: histogram of risk scores.
+  figure_4 = figure_4_data %>%
+    select(target_geoid, target_geography_name, risk_score) %>%
+    arrange(risk_score),
+
+  ## Figure 5: stacked bars.
+  figure_5 = figure_5_annual_by_flag %>%
+    select(territory_flag, year_declared, type, amount) %>%
+    mutate(amount_millions = amount / 1000000, .keep = "unused") %>%
+    arrange(territory_flag, year_declared, type),
+
+  ## Figure 6: stacked bars.
+  figure_6 = figure_6_plot_data %>%
+    select(territory_flag, fiscal_year, loan_type, approved_amount_total) %>%
+    mutate(approved_amount_millions = approved_amount_total / 1000000, .keep = "unused") %>%
+    arrange(territory_flag, fiscal_year, loan_type),
+
+  ## Figure 7: stacked bars.
+  figure_7 = figure_7_plot_data %>%
+    summarize(
+      .by = c(territory_flag, year_submitted, program),
+      federal_share_amount = sum(federal_share_amount, na.rm = TRUE)) %>%
+    arrange(territory_flag, year_submitted, program))
+
+openxlsx::write.xlsx(
+  feature_2_figure_data,
+  file.path(feature_2_export_directory, "feature_2_figure_data.xlsx"),
+  overwrite = TRUE)
+```
